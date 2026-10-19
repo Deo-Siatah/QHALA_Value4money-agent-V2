@@ -181,6 +181,47 @@ uv run python -m agent.run --resume run-20261015-103346 --decision approved --ap
 
 ---
 
+## Web interface
+
+The same run the terminal drives, in a browser. The web app lives in `web/` and talks to a small
+FastAPI server (`api/server.py`) that starts the agent, forwards its events, and serves the evidence
+file. Nothing in the interface decides anything: every figure still comes from the agent and its
+tools, so the browser and the terminal are looking at one run.
+
+Start the API with a token, then the interface, which uses the same token through a proxy:
+
+```powershell
+# in Value4money-agent/
+$env:API_TOKEN = "choose-something-for-this-machine"
+uv run uvicorn api.server:app --host 127.0.0.1 --port 8000
+
+# in Value4money-agent/web/
+Copy-Item .env.example .env      # paste the same API_TOKEN
+npm install
+npm run dev                      # http://localhost:5173
+```
+
+To see the run page without starting a real run, open
+`http://localhost:5173/runs/anything?replay=1` — it plays a recorded sequence of real events.
+
+**How it behaves.** Choosing the bid PDFs never starts anything: the files are staged by name, can be
+removed, and a run only begins when **Start Analysis** is pressed. While Hasibu works, the run page is
+a **single focal slot**, not a stack of cards: a numbered badge names the step that is happening now
+(`Step 3 of 8`), the model's words and the step's detail stream live inside it, and on completion the
+badge turns into a green tick before the same slot is handed to the next step. Once the pipeline
+pauses for a person (or finishes), that slot unfolds into a **vertical overview** — every step with
+its tick and one-line summary, each one expandable to inspect its citations, benchmark and pool. State
+is always carried by a word and a glyph as well as a colour, so the page reads correctly in greyscale
+and in print.
+
+**The token never reaches the browser.** `EventSource` cannot set request headers, and a token in the
+page would ship in the client bundle. In development Vite's proxy adds the `X-API-Token` header on the
+way past; in production `web/api/[...path].ts` does the same on Vercel, forwarding `/api/*` to the
+backend server-to-server. See [`web/README.md`](Value4money-agent/web/README.md) for the interface and
+its deployment in full.
+
+---
+
 ## How it works
 
 ```
@@ -221,6 +262,8 @@ nobody judged is not evidence** — it never reaches the median.
 
 ```
 main.py                 the interactive CLI
+api/                     the HTTP API the web interface talks to
+web/                     the React interface, and its Vercel deployment config
 agent/
   cli.py                the terminal front end: banner, live steps, approval, report
   graph.py              the eight nodes and their edges
@@ -254,7 +297,7 @@ Tests are the spec. Run one file at a time:
 uv run pytest tests/test_quality_check.py -q
 ```
 
-[`EVALS.md`](EVALS.md) records eight eval tasks with the command and the observed result for each,
+[`EVALS.md`](Value4money-agent/EVALS.md) records eight eval tasks with the command and the observed result for each,
 including the scale-guard correction and the one known failure we have not fixed. It is the honest
 record, including what does not work yet.
 

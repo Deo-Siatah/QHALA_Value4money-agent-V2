@@ -4,6 +4,7 @@
 # A failed audit write raises AuditError and blocks the tool: nothing runs unlogged.
 
 import functools
+import threading
 import inspect
 from contextlib import contextmanager
 from datetime import date, datetime, time
@@ -11,6 +12,7 @@ from decimal import Decimal
 from pathlib import PurePath
 from typing import Any, Callable, Dict, Optional
 from psycopg.types.json import Jsonb
+from config import settings
 from .db import get_conn
 
 
@@ -42,21 +44,122 @@ def _check_run_id(run_id: Any) -> str:
     return run_id
 
 
+class _ConnectionPool:
+    """A small pool of audit connections, built from get_conn so one code path opens them all.
+
+    Tool calls can now run at the same time, and every audit write needs a connection of its own.
+    Opening one per call exhausted what a free Postgres allows, and the run died with "server closed
+    the connection unexpectedly" rather than anything naming the cause.
+    """
+
+    def __init__(self, size: int) -> None:
+        self._size = max(1, size)
+        self._idle: list = []
+        self._lock = threading.Lock()
+
+    @contextmanager
+    def connection(self):
+        """Hand out an idle connection, or open one, and give it back when the work is done."""
+        with self._lock:
+            conn = self._idle.pop() if self._idle else None
+        owned = conn is None
+        if conn is None:
+            conn = get_conn()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                owned = True
+                conn = None
+            raise
+        finally:
+            if conn is not None and not owned:
+                with self._lock:
+                    if len(self._idle) < self._size:
+                        self._idle.append(conn)
+                        return
+            if owned and conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def close(self) -> None:
+        """Close every connection this pool is holding."""
+        with self._lock:
+            idle, self._idle = self._idle, []
+        for conn in idle:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+_pool_instance = None
+
+
+def _pool() -> "_ConnectionPool":
+    """One small connection pool for audit writes, built on first use."""
+    global _pool_instance
+    if _pool_instance is None:
+        _pool_instance = _ConnectionPool(settings.audit_pool_size)
+    return _pool_instance
+
+
+def close_pool() -> None:
+    """Close the audit pool, so a process that is ending does not hold connections open."""
+    global _pool_instance
+    if _pool_instance is not None:
+        _pool_instance.close()
+        _pool_instance = None
+
+
 @contextmanager
 def _audit_conn():
-    """Give one short-lived connection for one audit statement, wrapped as AuditError."""
+    """A pooled connection for one audit statement, wrapped as AuditError."""
     try:
-        conn = get_conn()
+        pool = _pool()
     except Exception as exc:
         raise AuditError(f"audit_log write failed: {exc}") from exc
     try:
-        yield conn
-        conn.commit()
+        with pool.connection() as conn:
+            yield conn
+    except AuditError:
+        raise
     except Exception as exc:
-        conn.rollback()
         raise AuditError(f"audit_log write failed: {exc}") from exc
+
+
+def sequence_health(conn: Any = None) -> dict:
+    """Report whether the audit_log id sequence has fallen behind the rows already written.
+
+    A reset that reinserts rows with their own  ids leaves the sequence where it was, and the next
+    insert fails on the primary key with nothing in the message to say why. Reading it is cheap, so
+    setup does it before the first run rather than during one.
+    """
+    owned = conn is None
+    conn = conn or get_conn()
+    try:
+        try:
+            row = conn.execute("SELECT last_value FROM audit_log_id_seq").fetchone()
+            last_value = row["last_value"] if row else None
+        except Exception:
+            return {"last_value": None, "max_id": None, "in_step": True, "fix": "",
+                    "checked": False}
+        row = conn.execute("SELECT max(id) AS max_id FROM audit_log").fetchone()
+        max_id = row["max_id"] if row else None
     finally:
-        conn.close()
+        if owned:
+            conn.close()
+
+    in_step = last_value is not None and (max_id is None or last_value >= max_id)
+    fix = "" if in_step else (
+        f"SELECT setval('audit_log_id_seq', {max_id or 0}, true);")
+    return {"last_value": last_value, "max_id": max_id, "in_step": in_step, "fix": fix,
+            "checked": True}
 
 
 def log_call(run_id: str, tool: str, inputs: Dict[str, Any], output: Optional[Any] = None,

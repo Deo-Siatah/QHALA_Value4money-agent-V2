@@ -23,7 +23,7 @@ from config import settings
 from agent.checkpointer import checkpointer
 from agent.graph import build_graph
 from agent.state import initial_state
-from agent.tracing import flush, init_tracing, trace_run, traced
+from agent.tracing import flush, init_tracing, record_graph, start_trace, traced
 
 FILED, PAUSED, DECLINED, NOT_FILED = 0, 2, 3, 4
 
@@ -127,10 +127,13 @@ def start(args: argparse.Namespace) -> int:
     paths = bid_paths(Path(args.bids_dir), args.pdfs)
     run_id = args.run_id or new_run_id()
     started_at = datetime.now(timezone.utc).isoformat()
+    start_trace(run_id)
 
     print(f"{run_id}: reading {len(paths)} bid file(s) from {args.bids_dir}")
     with checkpointer() as saver:
-        result = build_graph(saver).invoke(
+        graph = build_graph(saver)
+        record_graph(graph)
+        result = graph.invoke(
             initial_state(run_id, paths, started_at),
             {"configurable": {"thread_id": run_id}})
 
@@ -147,6 +150,7 @@ def resume(args: argparse.Namespace) -> int:
     run_id = args.resume
     decision = {"decision": args.decision, "approved_by": args.approved_by, "note": args.note or ""}
     config = {"configurable": {"thread_id": run_id}}
+    start_trace(run_id)
 
     print(f"{run_id}: resuming with decision '{args.decision}' from {args.approved_by}")
     with checkpointer() as saver:
@@ -155,7 +159,9 @@ def resume(args: argparse.Namespace) -> int:
                   "checkpoints were deleted. Start one with: uv run python main.py",
                   file=sys.stderr)
             return NOT_FILED
-        result = build_graph(saver).invoke(Command(resume=decision), config)
+        graph = build_graph(saver)
+        record_graph(graph)
+        result = graph.invoke(Command(resume=decision), config)
     return print_outcome(result, run_id)
 
 
@@ -208,9 +214,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"cannot start: {exc}", file=sys.stderr)
         return NOT_FILED
     finally:
-        # The SDK batches in the background and this process ends immediately afterwards,
-        # so anything still queued would be lost without this.
-        trace_run(run_id, phase="resume" if args.resume else "start")
+        # The thread id has to be written from inside the tracked function, while the root trace is
+        # open: before it there is no trace to update, and after it the trace has already closed.
+        # The SDK batches in the background and this process ends immediately afterwards, so
+        # anything still queued would be lost without the flush.
         flush()
     return code
 

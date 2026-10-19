@@ -16,9 +16,18 @@ data/raw/*
 # Generated reports
 outputs/
 
+# Uploaded tender documents, which are real bids and never belong in the repository
+uploads/
+
 # Environment and Secrets
 .env
 .env.*
+!.env.example
+
+# The web interface: installed packages and its build output
+web/node_modules/
+web/dist/
+web/.env
 
 # IDEs & OS
 .vscode/

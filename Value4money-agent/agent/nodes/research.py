@@ -39,17 +39,52 @@ MATCHES = ("strict", "loose", "fuzzy")
 
 WIDER_MATCH = {"strict": "loose", "loose": "fuzzy", "fuzzy": "fuzzy"}
 
+FIRST_MATCH = "loose"
+
 FALLBACK_AFTER_ATTEMPTS = 2
+
+
+def _first_search(state: AgentState) -> Dict[str, Any]:
+    """The opening search, built in code from the tender's own description.
+
+    The first query decides the pool, and the pool decides the median. Asking the model to phrase it
+    meant two runs over the same three bids could benchmark against different middles, and a bid
+    could cross the 50% line  between them. The tender description is already written once, by intake,
+    so the search starts from that same sentence every time. The model is asked only how to widen a
+    search that has already been run and found too thin.
+    """
+    return {"query": (state.get("description") or "").strip(),
+            "match": FIRST_MATCH,
+            "min_year": None}
 
 
 def _wider_search(state: AgentState) -> Dict[str, Any]:
     """Step the search one notch wider in code, for when the model cannot be reached."""
-    previous_match = state.get("match", "strict")
+    previous_match = state.get("match", FIRST_MATCH)
     match = WIDER_MATCH.get(previous_match, "fuzzy")
     min_year = state.get("min_year")
     if previous_match == "fuzzy":
         min_year = None
     return {"query": state.get("query", ""), "match": match, "min_year": min_year}
+
+
+MATCH_ORDER = {"strict": 0, "loose": 1, "fuzzy": 2}
+
+
+def _not_wider(previous: Dict[str, Any], proposed: Dict[str, Any]) -> bool:
+    """Whether a proposed search is no wider than the one already tried.
+
+    A model asked to widen can answer with the same strict search forever, spending every attempt on
+    a query already known to return nothing. Fuzzy with no year floor is the widest there is.
+    """
+    was = MATCH_ORDER.get(previous.get("match"), 0)
+    now = MATCH_ORDER.get(proposed.get("match"), 0)
+    if now < was:
+        return True
+    if now == was and not (now == 2 and proposed.get("min_year") is None
+                           and previous.get("min_year") is not None):
+        return True
+    return False
 
 
 def _previous(state: AgentState) -> Optional[Dict[str, Any]]:
@@ -72,9 +107,13 @@ def _previous(state: AgentState) -> Optional[Dict[str, Any]]:
 
 
 def _next_move(state: AgentState, attempt: int) -> Tuple[Dict[str, Any], List[str]]:
-    """Ask the model for the next search, falling back to a wider one in code if it cannot answer."""
+    """Ask the model to widen the search, falling back to a wider one in code if it cannot answer."""
+    previous = _previous(state)
+    if previous is None:
+        return _first_search(state), []
+
     payload = {"description": state.get("description"), "attempt": attempt,
-               "previous": _previous(state)}
+               "previous": previous}
     try:
         answer = ask_json("research_next_move", payload)
     except LlmError as exc:
@@ -87,7 +126,12 @@ def _next_move(state: AgentState, attempt: int) -> Tuple[Dict[str, Any], List[st
         raise ValueError(f"research_next_move gave query {query!r}, expected text")
     if min_year is not None and not isinstance(min_year, int):
         raise ValueError(f"research_next_move gave min_year {min_year!r}, expected a whole year or null")
-    return {"query": query.strip(), "match": match, "min_year": min_year}, []
+
+    proposed = {"query": query.strip(), "match": match, "min_year": min_year}
+    if _not_wider(previous, proposed):
+        return _wider_search(state), ["the model proposed a search no wider than the one already "
+                                      f"tried ({previous.get('match')}); widened in code instead"]
+    return proposed, []
 
 
 def _accumulated(previous: List[Dict[str, Any]], found: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

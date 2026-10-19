@@ -70,6 +70,10 @@ def searched(monkeypatch):
 def run(**overrides):
     state = initial_state("run-1", ["apex.pdf"], "2026-03-01T09:00:00Z")
     state.update({"description": "construction of classroom blocks", "category": "works"})
+    # Most tests here are about the model choosing how to widen, which only happens once a search
+    # has already run. Pass last_search=None to exercise the opening search, which code builds.
+    overrides.setdefault("last_search", {"query": "classroom block construction", "match": "strict",
+                                         "min_year": 2020, "count": 0})
     state.update(overrides)
     return state, research_node(state)
 
@@ -89,17 +93,24 @@ def test_the_first_attempt_has_no_previous_search(asked, searched):
     assert result["search_attempts"] == 1
 
 
-def test_the_first_payload_says_there_is_no_previous_search(asked, searched):
+def test_the_first_search_is_built_in_code_and_the_model_is_never_asked_for_it(asked, searched):
+    """The opening query decides the pool, and the pool decides the median, so code writes it."""
     calls = asked()
     searched()
 
-    run(search_attempts=0)
+    run(search_attempts=0, last_search=None)
 
-    name, payload = calls[0]
-    assert name == "research_next_move"
-    assert payload["attempt"] == 1
-    assert payload["previous"] is None
-    assert payload["description"] == "construction of classroom blocks"
+    assert calls == []
+
+
+def test_the_first_search_uses_the_tender_description_and_begins_at_loose(asked, searched):
+    asked()
+    calls = searched()
+
+    result = run(search_attempts=0, last_search=None)[1]
+
+    assert calls[0]["query"] == "construction of classroom blocks"
+    assert calls[0]["match"] == "loose"
 
 
 def test_a_retry_tells_the_model_what_fell_short(asked, searched):
@@ -377,6 +388,8 @@ def test_the_real_tool_returns_candidates_for_what_the_node_searched(audit_conn,
     result = research_node({
         "run_id": "run-int", "description": "construction of classroom blocks", "category": "works",
         "query": "classroom construction", "match": "strict", "min_year": None, "search_attempts": 0,
+        "last_search": {"query": "classroom construction", "match": "strict", "min_year": None,
+                        "count": 0},
     })
 
     assert result["last_search"]["count"] > 0
@@ -385,4 +398,77 @@ def test_the_real_tool_returns_candidates_for_what_the_node_searched(audit_conn,
         "SELECT * FROM audit_log WHERE run_id = %s ORDER BY id", ("run-int",)).fetchall()
     assert len(logged) == 1
     assert logged[0]["tool"] == "find_comparable_awards"
-    assert logged[0]["input"]["match"] == "strict"
+    assert logged[0]["input"]["match"] == "loose"
+
+
+def test_the_first_search_query_is_built_in_code_and_not_asked_of_the_model(monkeypatch):
+    """The first query decides the pool, so a model rephrasing it moved the median between runs."""
+    asked = []
+
+    def fake_ask(prompt_name, payload):
+        asked.append(prompt_name)
+        return {"query": "chainlink fence construction", "match": "strict", "min_year": 2023}
+
+    monkeypatch.setattr(research, "ask_json", fake_ask)
+
+    state = {"run_id": "run-1", "description": "construction of chainlink fence with a sliding gate",
+             "search_attempts": 0, "tender_ref": "T/1", "category": "works"}
+    result = research.research_node(state)
+
+    assert asked == []
+    assert result["query"] == "construction of chainlink fence with a sliding gate"
+
+
+def test_the_first_search_begins_at_loose_not_strict(monkeypatch):
+    """Strict matched almost nothing on this corpus and cost a full attempt every run."""
+    state = {"run_id": "run-1", "description": "construction of chainlink fence",
+             "search_attempts": 0, "tender_ref": "T/1", "category": "works"}
+    monkeypatch.setattr(research, "find_comparable_awards",
+                        lambda *args, **kwargs: {"awards": [], "count": 0})
+
+    result = research.research_node(state)
+
+    assert result["match"] == "loose"
+
+
+def test_the_model_still_chooses_how_to_widen_the_second_search(monkeypatch):
+    asked = []
+
+    def fake_ask(prompt_name, payload):
+        asked.append((prompt_name, payload))
+        return {"query": "fencing", "match": "fuzzy", "min_year": None}
+
+    monkeypatch.setattr(research, "ask_json", fake_ask)
+    monkeypatch.setattr(research, "find_comparable_awards",
+                        lambda *args, **kwargs: {"awards": [], "count": 0})
+
+    state = {"run_id": "run-1", "description": "chainlink fence", "search_attempts": 1,
+             "query": "chainlink fence", "match": "loose", "min_year": 2023,
+             "last_search": {"query": "chainlink fence", "match": "loose", "min_year": 2023,
+                             "count": 0},
+             "tender_ref": "T/1", "category": "works"}
+    research.research_node(state)
+
+    assert [name for name, _ in asked] == ["research_next_move"]
+
+
+def test_the_widening_after_a_model_answer_is_still_widened_by_a_rule(monkeypatch):
+    """A model that keeps proposing the same narrow search must not spend every attempt on it."""
+    calls = []
+
+    def fake_ask(prompt_name, payload):
+        calls.append(payload)
+        return {"query": "fence", "match": "strict", "min_year": 2024}
+
+    monkeypatch.setattr(research, "ask_json", fake_ask)
+    monkeypatch.setattr(research, "find_comparable_awards",
+                        lambda *args, **kwargs: {"awards": [], "count": 0})
+
+    state = {"run_id": "run-1", "description": "chainlink fence", "search_attempts": 1,
+             "query": "chainlink fence", "match": "loose", "min_year": 2023,
+             "last_search": {"query": "chainlink fence", "match": "loose", "min_year": 2023,
+                             "count": 0},
+             "tender_ref": "T/1", "category": "works"}
+    research.research_node(state)
+
+    assert state["match"] != "strict"

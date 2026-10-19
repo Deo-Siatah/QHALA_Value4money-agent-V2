@@ -150,3 +150,70 @@ def test_failed_audit_update_raises_even_though_the_tool_ran(logged, monkeypatch
     assert calls == ["run-1"]
     assert "audit" in str(err.value).lower()
     assert logged()[0]["output"] is None
+
+
+def test_the_audit_sequence_is_reported_against_the_highest_row_written():
+    """The duplicate-key crash of 15 Oct happened because the sequence fell behind the table."""
+    from mcp_server import audit
+
+    class Conn:
+        def execute(self, sql, *args):
+            text = sql.strip()
+            if "last_value" in text:
+                return Rows([{"last_value": 2}])
+            return Rows([{"max_id": 28}])
+
+    class Rows:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchone(self):
+            return self._rows[0]
+
+    report = audit.sequence_health(Conn())
+
+    assert report["last_value"] == 2
+    assert report["max_id"] == 28
+    assert report["in_step"] is False
+    assert "setval" in report["fix"]
+
+
+def test_an_empty_audit_table_is_in_step():
+    from mcp_server import audit
+
+    class Rows:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchone(self):
+            return self._rows[0]
+
+    class Conn:
+        def execute(self, sql, *args):
+            return Rows([{"last_value": 1, "max_id": None}] if "last_value" in sql
+                        else [{"max_id": None}])
+
+    report = audit.sequence_health(Conn())
+
+    assert report["in_step"] is True
+    assert report["fix"] == ""
+
+
+def test_a_sequence_ahead_of_the_table_is_still_in_step():
+    """An unused sequence is harmless; only falling behind produces duplicate keys."""
+    from mcp_server import audit
+
+    class Rows:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchone(self):
+            return self._rows[0]
+
+    class Conn:
+        def execute(self, sql, *args):
+            return Rows([{"last_value": 90}] if "last_value" in sql else [{"max_id": 28}])
+
+    report = audit.sequence_health(Conn())
+
+    assert report["in_step"] is True

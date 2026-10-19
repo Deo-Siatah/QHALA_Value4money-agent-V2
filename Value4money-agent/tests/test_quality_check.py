@@ -139,6 +139,59 @@ def test_an_unjudged_usable_row_is_excluded_and_the_error_recorded(monkeypatch):
     assert result["pool_size"] == 0
 
 
+def test_the_similarity_prompt_is_asked_in_batches_so_one_answer_stays_short(monkeypatch):
+    """One answer covering 28 awards came back cut off mid-object, finish_reason 'length'.
+
+    Every award the model never reached was then counted as excluded work and the pool came out
+    empty, which is what an empty tender review is not allowed to be. Each batch now carries at
+    most judgement_batch_size awards.
+    """
+    monkeypatch.setattr(quality_check.settings, "judgement_batch_size", 4)
+    calls = answered(monkeypatch,
+                     similarity=lambda p: same_work(*[a["award_id"] for a in p["awards"]]))
+
+    result = run([candidate(f"a{i:02d}") for i in range(1, 11)])
+
+    assert [len(batch["awards"]) for batch in calls["quality_similarity_judgement"]] == [4, 4, 2]
+    assert result["pool_size"] == 10
+
+
+def test_every_award_is_offered_to_the_model_exactly_once_across_the_batches(monkeypatch):
+    monkeypatch.setattr(quality_check.settings, "judgement_batch_size", 3)
+    calls = answered(monkeypatch,
+                     similarity=lambda p: same_work(*[a["award_id"] for a in p["awards"]]))
+    rows = [candidate(f"a{i:02d}") for i in range(1, 9)]
+
+    run(rows)
+
+    offered = [a["award_id"] for batch in calls["quality_similarity_judgement"]
+               for a in batch["awards"]]
+    assert sorted(offered) == [row["award_id"] for row in rows]
+
+
+def test_one_failed_batch_costs_only_the_awards_it_carried(monkeypatch):
+    """A batch the model could not answer is recorded, and the batches either side still count."""
+    monkeypatch.setattr(quality_check.settings, "judgement_batch_size", 2)
+    seen = []
+
+    def fake_ask(prompt_name, payload):
+        if prompt_name != "quality_similarity_judgement":
+            return {"verdicts": {}}
+        ids = [a["award_id"] for a in payload["awards"]]
+        seen.append(ids)
+        if ids == ["a03", "a04"]:
+            raise LlmError("groq timed out")
+        return {"judgements": same_work(*ids)}
+
+    monkeypatch.setattr(quality_check, "ask_json", fake_ask)
+
+    result = run([candidate(f"a{i:02d}") for i in range(1, 7)])
+
+    assert seen == [["a01", "a02"], ["a03", "a04"], ["a05", "a06"]]
+    assert result["pool_size"] == 4
+    assert any("groq timed out" in error for error in result["errors"])
+
+
 def test_pool_verdicts_use_one_vocabulary(monkeypatch):
     answered(monkeypatch,
              similarity=lambda p: {a["award_id"]: {"verdict": "different_work" if a["award_id"] == "a04"

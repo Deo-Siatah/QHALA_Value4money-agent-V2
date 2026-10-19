@@ -4,6 +4,7 @@ from langgraph.types import Command
 
 from agent import graph
 from agent.graph import build_graph
+from agent.nodes import approval
 from agent.nodes.approval import approval_node, _read_decision, _request
 
 
@@ -122,3 +123,95 @@ def test_a_verification_failure_is_shown_to_the_approver(monkeypatch):
     result = run.invoke(Command(resume=_resume("approved")), config)
 
     assert result["submission"] == {"report_id": 7}
+
+def answering(monkeypatch, **decision):
+    """Answer the interrupt and hand back every payload the approver was shown."""
+    seen = []
+
+    def fake_interrupt(payload):
+        seen.append(payload)
+        return decision
+
+    monkeypatch.setattr(approval, "interrupt", fake_interrupt)
+    return seen
+
+
+def insufficient_state(**overrides):
+    """A state whose pool was too thin to benchmark anything."""
+    state = {"run_id": "run-1", "tender_ref": "T/1", "summary": "No comparables found.",
+             "review_markdown": "# Review\n\nNot enough comparable awards.",
+             "benchmark": {"n": 0, "confidence": "insufficient", "median_kes": None,
+                           "q1_kes": None, "q3_kes": None, "bids": []},
+             "verify_ok": True, "verify_failures": []}
+    state.update(overrides)
+    return state
+
+
+def test_an_insufficient_benchmark_is_flagged_in_what_the_approver_is_shown(monkeypatch):
+    """The person has to be told the report holds no evidence before they approve it."""
+    seen = answering(monkeypatch, decision="publish_anyway", approved_by="Deo Siatah")
+
+    approval_node(insufficient_state())
+
+    assert seen[-1]["evidence_status"] == "no_evidence"
+
+
+def test_a_real_benchmark_is_flagged_as_having_evidence(monkeypatch):
+    seen = answering(monkeypatch, decision="approved", approved_by="Deo Siatah")
+    state = insufficient_state(benchmark={"n": 17, "confidence": "high", "median_kes": 2_670_667.86,
+                                          "q1_kes": 1.0, "q3_kes": 3.0, "bids": []})
+
+    approval_node(state)
+
+    assert seen[-1]["evidence_status"] == "has_evidence"
+
+
+def test_approving_a_report_with_no_evidence_is_refused(monkeypatch):
+    """Filing an evidence-free report needs a deliberate second step, not a plain approval."""
+    monkeypatch.setattr(approval, "interrupt",
+                        lambda payload: {"decision": "approved", "approved_by": "Deo Siatah"})
+
+    with pytest.raises(ValueError) as err:
+        approval_node(insufficient_state())
+
+    assert "no comparable awards" in str(err.value).lower()
+
+
+def test_publishing_anyway_is_a_different_decision_the_person_has_to_choose(monkeypatch):
+    monkeypatch.setattr(approval, "interrupt",
+                        lambda payload: {"decision": "publish_anyway", "approved_by": "Deo Siatah",
+                                         "note": "proceeding without a benchmark"})
+
+    result = approval_node(insufficient_state())
+
+    assert result["approval_status"] == "approved"
+    assert result["approval_note"] == "proceeding without a benchmark"
+
+
+def test_publishing_anyway_still_needs_a_named_person(monkeypatch):
+    monkeypatch.setattr(approval, "interrupt",
+                        lambda payload: {"decision": "publish_anyway", "approved_by": "agent"})
+
+    with pytest.raises(ValueError):
+        approval_node(insufficient_state())
+
+
+def test_a_report_with_evidence_is_approved_the_usual_way(monkeypatch):
+    monkeypatch.setattr(approval, "interrupt", lambda payload: {"decision": "approved",
+                                                               "approved_by": "Deo Siatah"})
+    state = insufficient_state(benchmark={"n": 17, "confidence": "high", "median_kes": 2_670_667.86,
+                                          "q1_kes": 1.0, "q3_kes": 3.0, "bids": []})
+
+    result = approval_node(state)
+
+    assert result["approval_status"] == "approved"
+
+
+def test_declining_is_always_allowed_even_without_evidence(monkeypatch):
+    """Refusing to file is always the easy answer; only filing is gated."""
+    monkeypatch.setattr(approval, "interrupt", lambda payload: {"decision": "rejected",
+                                                               "approved_by": "Deo Siatah"})
+
+    result = approval_node(insufficient_state())
+
+    assert result["approval_status"] == "rejected"

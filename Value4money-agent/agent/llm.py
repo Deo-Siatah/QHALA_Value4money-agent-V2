@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from config import settings
-from agent.tracing import annotate_llm, traced
+from agent.tracing import annotate_llm, log_model_call, traced
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
@@ -22,12 +22,17 @@ class LlmError(RuntimeError):
 
 
 def _build_groq() -> Any:
-    """Build a Groq chat model, passing the key only when settings holds one."""
+    """Build a Groq chat model, passing the key only when settings holds one.
+
+    max_tokens is set rather than left to the provider. Without it the reply is cut off part way
+    through a long answer, and the cut arrives as text that is not JSON, so a judgement covering
+    every candidate award lost the awards the model had not reached yet.
+    """
     from langchain_groq import ChatGroq
 
     keys = {"groq_api_key": settings.groq_api_key} if settings.groq_api_key else {}
     return ChatGroq(model=settings.llm_model, temperature=settings.llm_temperature,
-                    timeout=settings.llm_timeout_s, **keys)
+                    timeout=settings.llm_timeout_s, max_tokens=settings.llm_max_tokens, **keys)
 
 
 def _build_ollama() -> Any:
@@ -81,11 +86,14 @@ def ask_json(prompt_name: str, payload: Dict[str, Any]) -> dict:
         raise LlmError(f"prompt '{prompt_name}' could not be read from {prompt_path}: {exc}") from exc
 
     persona = (PROMPTS_DIR / "persona.md").read_text(encoding="utf-8")
+    system = f"{persona}\n\n{prompt}"
     reply = _ask_model(prompt_name, [
-        SystemMessage(content=f"{persona}\n\n{prompt}"),
+        SystemMessage(content=system),
         HumanMessage(content=json.dumps(payload, indent=2, default=str)),
     ])
-    return _parse_json(reply, prompt_name)
+    answer = _parse_json(reply, prompt_name)
+    log_model_call(prompt_name, system, payload, answer=answer)
+    return answer
 
 
 @traced("llm")

@@ -183,6 +183,70 @@ def test_a_missing_database_url_is_refused_clearly(monkeypatch):
     assert "DATABASE_URL" in str(err.value)
 
 
+@pytest.fixture(autouse=True)
+def no_shared_saver_left_open():
+    """Close the process-wide saver after every test here, so one test cannot hand its pool on."""
+    yield
+    checkpointer.close_shared_saver()
+
+
+def test_the_shared_saver_is_opened_once_and_handed_out_again(schema):
+    """A server keeps its paused runs for as long as it is up, so it needs one saver, not one per
+    request. Opening a pool per request set the tables up again each time and threw the pool away
+    while a run was still waiting for its approval."""
+    first = checkpointer.shared_saver(url_for(schema))
+    second = checkpointer.shared_saver(url_for(schema))
+
+    assert first is second
+
+
+def test_closing_the_shared_saver_releases_its_pool_and_allows_another(schema):
+    first = checkpointer.shared_saver(url_for(schema))
+    first_pool = first.conn
+
+    checkpointer.close_shared_saver()
+
+    assert first_pool.closed is True
+    second = checkpointer.shared_saver(url_for(schema))
+    assert second is not first
+    assert second.conn.closed is False
+
+
+def test_closing_the_shared_saver_twice_is_harmless(schema):
+    checkpointer.shared_saver(url_for(schema))
+
+    checkpointer.close_shared_saver()
+    checkpointer.close_shared_saver()
+
+
+def test_the_shared_saver_refuses_a_missing_database_url_by_name(monkeypatch):
+    monkeypatch.setattr(checkpointer.settings, "database_url", "")
+
+    with pytest.raises(ValueError) as err:
+        checkpointer.shared_saver()
+
+    assert "DATABASE_URL" in str(err.value)
+
+
+def test_a_paused_run_survives_in_the_shared_saver(schema, monkeypatch):
+    """The reason the saver is shared: the approval interrupt is resumed by a later HTTP request."""
+    _faked(monkeypatch)
+    config = {"configurable": {"thread_id": "run-shared"}}
+    saver = checkpointer.shared_saver(url_for(schema))
+
+    paused = build_graph(saver).invoke({"run_id": "run-shared", "review_markdown": "# report\n"},
+                                       config)
+
+    assert "__interrupt__" in paused
+
+    finished = build_graph(checkpointer.shared_saver(url_for(schema))).invoke(
+        Command(resume={"decision": "approved", "approved_by": "Grace Wanjiku", "note": "seen"}),
+        config)
+
+    assert finished["approval_status"] == "approved"
+    assert finished["submission"] == {"report_id": 7}
+
+
 def test_the_in_memory_saver_still_pauses_without_a_database(monkeypatch):
     _faked(monkeypatch)
     config = {"configurable": {"thread_id": "run-memory"}}

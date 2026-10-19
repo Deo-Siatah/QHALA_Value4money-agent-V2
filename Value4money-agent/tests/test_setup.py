@@ -198,3 +198,67 @@ def fake_console(monkeypatch):
     """Setup prints through its own sink so tests read lines, not rich output."""
     monkeypatch.setattr(setup, "say", lambda line="": None)
     return True
+
+
+def test_setup_warns_when_the_audit_sequence_would_fail_the_first_tool_call(capsys):
+    """The drift is invisible until it throws, so setup says so while it can still be fixed."""
+    class Rows:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchone(self):
+            return self._rows[0]
+
+    class DriftedConn(FakeConn):
+        def execute(self, sql, *args):
+            text = sql.strip()
+            if "last_value" in text:
+                return Rows([{"last_value": 2}])
+            if "max(id)" in text:
+                return Rows([{"max_id": 28}])
+            return super().execute(sql, *args)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(setup.settings, "database_url", "postgresql://x")
+    monkeypatch.setattr(setup, "connect", lambda url: DriftedConn())
+    monkeypatch.setattr(setup, "sanity_lines", lambda conn, emit=None: None)
+    try:
+        code = main([])
+    finally:
+        monkeypatch.undo()
+
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "WARNING" in out
+    assert "setval" in out
+
+
+def test_setup_reports_a_sequence_that_is_in_step(capsys):
+    class Rows:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchone(self):
+            return self._rows[0]
+
+    class HealthyConn(FakeConn):
+        def execute(self, sql, *args):
+            text = sql.strip()
+            if "last_value" in text:
+                return Rows([{"last_value": 40}])
+            if "max(id)" in text:
+                return Rows([{"max_id": 28}])
+            return super().execute(sql, *args)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(setup.settings, "database_url", "postgresql://x")
+    monkeypatch.setattr(setup, "connect", lambda url: HealthyConn())
+    monkeypatch.setattr(setup, "sanity_lines", lambda conn, emit=None: None)
+    try:
+        main([])
+    finally:
+        monkeypatch.undo()
+
+    out = capsys.readouterr().out
+    assert "WARNING" not in out
+    assert "audit_log: sequence at 40" in out

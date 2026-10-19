@@ -133,6 +133,28 @@ def _check_figures(state: AgentState) -> List[str]:
     return sorted(problems, key=lambda problem: problem)
 
 
+def _check_positions(state: AgentState) -> List[str]:
+    """A bid may only be placed against the pool when the pool was big enough to place it.
+
+    benchmark_price returns no percentages at all when the pool is too thin, so a report carrying
+    one has written a number the statistics never produced. That is how a 228,639% figure reached a
+    committee: a comparison against a median of nothing.
+    """
+    benchmark = state.get("benchmark", {})
+    if benchmark.get("confidence") != "insufficient":
+        return []
+
+    problems = []
+    for bid in benchmark.get("bids") or []:
+        if bid.get("position"):
+            problems.append(f"{bid.get('bidder')} is labelled {bid['position']}, but with no "
+                            "comparable awards a bid cannot be labelled by position at all")
+        if bid.get("pct_vs_median") is not None:
+            problems.append(f"{bid.get('bidder')} is given {bid['pct_vs_median']}% against a "
+                            "median that was never computed")
+    return problems
+
+
 def verify_sources_node(state: AgentState) -> dict:
     """Check the draft's sources and figures, and say whether a human may see it."""
     problems: List[str] = []
@@ -142,6 +164,7 @@ def verify_sources_node(state: AgentState) -> dict:
         problems.append("no review to verify: the previous draft was refused")
     problems += _check_sources(state)
     problems += _check_figures(state)
+    problems += _check_positions(state)
     if state.get("benchmark", {}).get("confidence") == "insufficient" and NOT_ENOUGH not in markdown:
         problems.append(f"the evidence is thin but the report does not say: {NOT_ENOUGH}")
 

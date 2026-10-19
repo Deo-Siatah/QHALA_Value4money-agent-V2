@@ -85,6 +85,21 @@ def apply_demo_slice(conn: Any, slice_sql: str,
     emit(f"loaded {award_count(conn)} awards from sql/demo_data.sql")
 
 
+def audit_health(conn: Any, emit: Callable[[str], None] = say) -> None:
+    """Warn if audit_log's id sequence has fallen behind, which would fail the first tool call."""
+    from mcp_server.audit import sequence_health
+
+    report = sequence_health(conn)
+    if not report.get("checked"):
+        return
+    if report["in_step"]:
+        emit(f"audit_log: sequence at {report['last_value']}, highest row {report['max_id']}")
+    else:
+        emit(f"audit_log: WARNING its id sequence is at {report['last_value']} but row "
+             f"{report['max_id']} exists, so the first tool call will fail on a duplicate key. Fix:")
+        emit(f"  {report['fix']}")
+
+
 def sanity_lines(conn: Any, emit: Callable[[str], None] = say) -> None:
     """Report the pool the agent will search, so it is visible before anything runs."""
     from loader.make_demo_slice import KEYWORDS
@@ -120,6 +135,7 @@ def main(argv: List[str] = None) -> int:
             report_connection(conn)
             apply_schema(conn, read_sql(SCHEMA_PATH), read_sql(INDEXES_PATH))
             apply_demo_slice(conn, read_sql(SLICE_PATH))
+            audit_health(conn)
             say("")
             say("what the agent will search when you run it:")
             sanity_lines(conn)

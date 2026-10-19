@@ -222,6 +222,118 @@ this database already holds awards, so the demo slice was not loaded
 
 ---
 
+## Task 11 — the same bids produce the same answer
+
+**What it checks.** Opik's own analysis of 151 traces found that nine runs over the *same* three fence
+bids produced medians from KES 1.94M to 2.84M, and one bid came out `within_range` in some runs and
+`far_above` in others. The cause: the opening search query was written by the model, so each run drew
+a different pool, and the pool decides the median.
+
+**The fix.** The first search is now built in code from the tender description intake already wrote,
+and begins at `loose` rather than `strict` (strict returned nothing in 13 of 15 first attempts). The
+model is asked only how to *widen* a search that has already run too thin, and a proposal that is no
+wider than the previous one is overridden in code.
+
+**Commands.**
+```
+uv run pytest tests/test_research.py tests/test_stability.py -q -p no:warnings
+uv run python -m evals.stability --runs 5        # live, needs the model and the database
+```
+
+**Result: PASS — 29 + 11 passed, 0 failed.**
+
+`evals/stability.py` judges a run set by two things: the medians within 10% of each other, and no
+bid changing position between runs. The tolerance is 10% deliberately: the observed failure was about
+19% either side of the middle, so a wider band would have passed the exact bug it exists to catch.
+An empty result is reported as *not steady* rather than vacuously steady.
+
+**What it proves.** The first query no longer moves between runs, so a median can no longer move
+because the model phrased the opening search differently.
+
+---
+
+## Task 12 — no report is filed without a benchmark, unless a person says so
+
+**What it checks.** Three of the road runs were approved and filed with no benchmark at all. The
+approval gate now refuses a plain approval when `confidence` is `insufficient`, and requires a
+different word, `p Name`, to publish a document that holds no evidence. `verify_sources` separately
+refuses any `far_above`/`far_below` label or percentage when the pool was too thin to produce one.
+
+**Command.**
+```
+uv run pytest tests/test_approval.py tests/test_verify_sources.py tests/test_cli.py -q -p no:warnings
+```
+
+**Result: PASS — 21 + 25 + 43 passed, 0 failed** (one pre-existing failure in
+`test_verify_sources.py` described under Task 07).
+
+**Confirmed live.** The roads run now stops at a panel reading *"this report has no comparable awards,
+so it holds no evidence"* and offers `p Your Name`. The filed report states plainly that the pool is
+empty, that confidence is insufficient, and that 33 candidates were excluded as `scale_mismatch`.
+
+---
+
+## Task 13 — traces show what was asked and what came back
+
+**What it checks.** Opik held 151 node spans but no tool spans, no model spans and no prompts. The
+reason: `@traced(...)` was applied as a module-level decorator, so it ran at import time, long before
+`init_tracing()` configured Opik, and returned the function untouched.
+
+**The fix.** `traced()` now decides at call time, so every tool call and every model call produces a
+span. `research_next_move` records its full prompt text, payload and answer, because that prompt
+decides what the pool becomes; other prompts record their name and payload keys only, so tender and
+bid content is not shipped to a third-party trace store by default. `main.py` opens one root
+`agent_run` span and threads the trace by `run_id`.
+
+**Approval pauses are no longer logged as errors.** `GraphInterrupt` is caught, the span closes with
+`outcome: paused_for_approval` and `error_info: None`, and the original exception is re-raised with its
+payload intact so the run still pauses correctly.
+
+**Command.**
+```
+uv run pytest tests/test_tracing.py -q -p no:warnings
+```
+
+**Result: PASS — 28 passed, 0 failed.**
+
+**Threads, and a mistake worth recording.** Two further faults kept the Threads tab empty. The run
+id was being written by `init_tracing()`, which runs *before* `opik.track()` opens the root trace, so
+the thread id was set on nothing; `run.py` repeated this by writing it in a `finally` block, after the
+trace had already closed. It is now written from inside the tracked function, where a trace exists.
+The thread is the run, so a run and its later `--resume` are one conversation; the tender reference
+is a **tag**, because two runs of the same tender are two threads and threading them together would
+split a run away from its own approval.
+
+**And a mistake of my own.** Parallel parsing reported 27 stray `parse_bid_pdf` traces because each
+worker copied the context *inside* itself, where it is empty — a fresh thread starts with no context
+vars. The context is now captured in the intake node's own thread and each worker runs inside its own
+copy of it (one `Context` object cannot be entered by two threads at once). Those parse calls are spans
+under `intake` again.
+
+---
+
+## Task 14 — bid PDFs are read at the same time
+
+**What it checks.** Opik measured intake at roughly 5.5 seconds per PDF, because each was parsed in
+turn. Six bids took about 33 seconds.
+
+**Command.**
+```
+uv run pytest tests/test_intake.py -q -p no:warnings
+```
+
+**Result: PASS — 17 passed, 0 failed.** The concurrency test uses a barrier of two, so it fails if the
+files are read one after another.
+
+**Observed live.** Intake for the six road bids: **10.7 to 16.3 seconds**, down from about 33.
+
+**One bug this exposed.** Parsing in parallel meant concurrent audit writes, and every audit write
+opened its own connection. That exhausted what the database allows and the run died with *"server
+closed the connection unexpectedly"*, which named nothing useful. Audit writes now share a small pool
+(`AUDIT_POOL_SIZE`, default 4) and the parse pool is capped to match.
+
+---
+
 ## The failure I did not fix
 
 **The search cannot be told to find awards of a comparable size.**

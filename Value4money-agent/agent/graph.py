@@ -38,7 +38,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from config import settings
 from agent.state import AgentState
-from agent.tracing import traced
+from agent.tracing import track_graph
 from agent.nodes.intake import intake_node
 from agent.nodes.research import research_node
 from agent.nodes.quality_check import quality_check_node
@@ -80,12 +80,14 @@ def build_graph(checkpointer: BaseCheckpointSaver | None = None):
     """Build and compile the run, with a checkpointer so the approval interrupt can resume."""
     builder = StateGraph(AgentState)
 
-    # Nodes are wrapped here, not at import, so a test can hand the graph fakes instead
+    # Nodes are registered as plain functions, not traced ones. The LangGraph tracer records every
+    # node itself and is what carries the graph structure to Opik, so wrapping them here as well
+    # would log each node twice.
     for name, node in [("intake", intake_node), ("research", research_node),
                        ("quality_check", quality_check_node), ("score", score_node),
                        ("draft", draft_node), ("verify_sources", verify_sources_node),
                        ("approval", approval_node), ("file", file_node)]:
-        builder.add_node(name, traced("general", name)(node))
+        builder.add_node(name, node)
 
     builder.add_edge(START, "intake")
     builder.add_conditional_edges("intake", route_after_intake, {"research": "research", END: END})
@@ -99,4 +101,4 @@ def build_graph(checkpointer: BaseCheckpointSaver | None = None):
     builder.add_conditional_edges("approval", route_after_approval, {"file": "file", END: END})
     builder.add_edge("file", END)
 
-    return builder.compile(checkpointer=checkpointer)
+    return track_graph(builder.compile(checkpointer=checkpointer))

@@ -20,13 +20,18 @@
 # What it returns: the parsed bids, the tender reference, the category, the description of the work,
 # and any parse issues. Everything else in state is left alone.
 
-from typing import Any, Dict, List
+import contextvars
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Tuple
 
 from config import settings
 from mcp_server.tools.parse_bid_pdf import BidParseError
 from agent.state import AgentState
 from agent.llm import ask_json
 from agent.tools import parse_bid_pdf
+from agent.tracing import record_tender
+
+MAX_PARSE_WORKERS = 4
 
 CATEGORIES = ("works", "goods", "services")
 
@@ -43,23 +48,58 @@ def _tender_profile(tender_ref: str, items: List[Dict[str, Any]]) -> Dict[str, s
     return {"category": category, "description": description.strip()}
 
 
+def _parse_in(context: Any, run_id: str, path: str) -> Any:
+    """Parse one bid inside a copy of the node's tracing context.
+
+    Each worker gets its own copy. One Context object cannot be entered by two threads at once, and
+    reusing it would raise "cannot enter context ... already entered" as soon as two bids parsed
+    together.
+    """
+    try:
+        return context.copy().run(parse_bid_pdf, run_id, path)
+    except BidParseError as exc:
+        return exc
+
+
+def _parse_all(run_id: str, paths: List[str]) -> List[Tuple[str, Any]]:
+    """Read every bid PDF at once and keep each result with the path it came from.
+
+    Parsing is file reading and text extraction, so it waits on the disk rather than on anything a
+    thread pool can improve. It was done one PDF after another, and intake cost roughly 5.5 seconds
+    per bid: three bids took about 19 seconds and six took about 33.
+
+    The tracing context is captured here, in the node's own thread, and handed to each worker. A
+    context copied inside the worker would be an empty one, because a new thread starts with none,
+    and every parse would report itself as its own root trace instead of a span under intake.
+    """
+    if len(paths) < 2:
+        context = contextvars.copy_context()
+        return [(path, _parse_in(context, run_id, path)) for path in paths]
+
+    context = contextvars.copy_context()
+    with ThreadPoolExecutor(max_workers=min(len(paths), MAX_PARSE_WORKERS)) as pool:
+        parsed = pool.map(lambda path: _parse_in(context, run_id, path), paths)
+        return list(zip(paths, parsed))
+
+
 def intake_node(state: AgentState) -> dict:
     """Parse the bid PDFs, then ask the model what kind of work was tendered."""
     run_id = state["run_id"]
     bids: List[Dict[str, Any]] = []
     parse_issues: List[str] = []
 
-    for path in state.get("pdf_paths", []):
-        try:
-            bids.append(parse_bid_pdf(run_id, path))
-        except BidParseError as exc:
-            parse_issues.append(f"{path}: {exc}")
+    for path, parsed in _parse_all(run_id, list(state.get("pdf_paths", []))):
+        if isinstance(parsed, BidParseError):
+            parse_issues.append(f"{path}: {parsed}")
+        else:
+            bids.append(parsed)
 
     if not bids:
         return {"bids": bids, "parse_issues": parse_issues,
                 "errors": [f"no bid could be parsed from {state.get('pdf_paths')}: {parse_issues}"]}
 
     tender_ref = bids[0]["tender_ref"]
+    record_tender(tender_ref)
     result: Dict[str, Any] = {
         "bids": bids,
         "parse_issues": parse_issues,

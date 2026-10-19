@@ -1,6 +1,7 @@
 import pytest
 
 from agent.nodes import intake
+from mcp_server.tools.parse_bid_pdf import BidParseError
 from agent.nodes.intake import intake_node
 from agent.state import initial_state
 from conftest import make_pdf
@@ -219,3 +220,151 @@ def test_initial_state_takes_the_list_of_paths():
     assert state["pdf_paths"] == ["a.pdf", "b.pdf"]
     assert "pdf_path" not in state
     assert "exclude_ocid" not in state
+
+
+def test_the_bids_are_parsed_at_the_same_time_not_one_after_another(monkeypatch):
+    """Six bids took twice as long as three because each PDF was read in turn. A barrier of two
+    only lets both through if they are in flight together, so this fails if they are serialised."""
+    import threading
+
+    barrier = threading.Barrier(2, timeout=5)
+
+    def slow_parse(run_id, path):
+        barrier.wait()
+        return {"bidder": f"Bidder for {path}", "tender_ref": "T/1", "items": [],
+                "stated_total": 100.0, "computed_total": 100.0, "arithmetic_ok": True,
+                "currency": "KES", "issues": []}
+
+    monkeypatch.setattr(intake, "parse_bid_pdf", slow_parse)
+    monkeypatch.setattr(intake, "ask_json", lambda name, payload: {"category": "works",
+                                                                  "description": "fencing"})
+
+    state = {"run_id": "run-1", "pdf_paths": ["a.pdf", "b.pdf"], "search_attempts": 0}
+    result = intake.intake_node(state)
+
+    assert len(result["bids"]) == 2
+
+
+def test_the_bids_come_back_in_the_order_the_pdfs_were_given(monkeypatch):
+    """Order matters: the first bid supplies the tender reference the report is written under."""
+    def parse(run_id, path):
+        return {"bidder": path, "tender_ref": "T/1", "items": [], "stated_total": 1.0,
+                "computed_total": 1.0, "arithmetic_ok": True, "currency": "KES", "issues": []}
+
+    monkeypatch.setattr(intake, "parse_bid_pdf", parse)
+    monkeypatch.setattr(intake, "ask_json", lambda name, payload: {"category": "works",
+                                                                  "description": "fencing"})
+
+    result = intake.intake_node({"run_id": "run-1", "pdf_paths": ["z.pdf", "m.pdf", "a.pdf"]})
+
+    assert [bid["bidder"] for bid in result["bids"]] == ["z.pdf", "m.pdf", "a.pdf"]
+
+
+def test_one_bid_that_cannot_be_read_does_not_stop_the_others(monkeypatch):
+    def parse(run_id, path):
+        if path == "bad.pdf":
+            raise BidParseError("no items found")
+        return {"bidder": path, "tender_ref": "T/1", "items": [], "stated_total": 1.0,
+                "computed_total": 1.0, "arithmetic_ok": True, "currency": "KES", "issues": []}
+
+    monkeypatch.setattr(intake, "parse_bid_pdf", parse)
+    monkeypatch.setattr(intake, "ask_json", lambda name, payload: {"category": "works",
+                                                                  "description": "fencing"})
+
+    result = intake.intake_node({"run_id": "run-1", "pdf_paths": ["good.pdf", "bad.pdf"]})
+
+    assert [bid["bidder"] for bid in result["bids"]] == ["good.pdf"]
+    assert any("bad.pdf" in issue and "no items found" in issue
+               for issue in result["parse_issues"])
+
+
+def test_a_single_bid_is_still_parsed(monkeypatch):
+    monkeypatch.setattr(intake, "parse_bid_pdf",
+                        lambda run_id, path: {"bidder": "Apex", "tender_ref": "T/1", "items": [],
+                                              "stated_total": 1.0, "computed_total": 1.0,
+                                              "arithmetic_ok": True, "currency": "KES", "issues": []})
+    monkeypatch.setattr(intake, "ask_json", lambda name, payload: {"category": "works",
+                                                                  "description": "fencing"})
+
+    result = intake.intake_node({"run_id": "run-1", "pdf_paths": ["only.pdf"]})
+
+    assert result["tender_ref"] == "T/1"
+
+
+def test_when_every_bid_fails_the_run_says_so(monkeypatch):
+    def parse(run_id, path):
+        raise BidParseError("no items found")
+
+    monkeypatch.setattr(intake, "parse_bid_pdf", parse)
+
+    result = intake.intake_node({"run_id": "run-1", "pdf_paths": ["a.pdf", "b.pdf"]})
+
+    assert result["bids"] == []
+    assert result["errors"]
+    assert len(result["parse_issues"]) == 2
+
+
+def test_a_worker_thread_still_reports_its_work_under_the_node_that_started_it(monkeypatch):
+    """A context copied inside a worker is an empty one, so every parse became its own trace.
+
+    Twenty-seven stray parse_bid_pdf traces appeared because each worker started with no context at
+    all. The context has to be captured in the node's thread and handed to the worker.
+    """
+    import contextvars
+
+    marker = contextvars.ContextVar("opik-marker")
+    marker.set("intake-span")
+    seen = []
+
+    def parse(run_id, path):
+        seen.append(marker.get("LOST"))
+        return {"bidder": path, "tender_ref": "T/1", "items": [], "stated_total": 1.0,
+                "computed_total": 1.0, "arithmetic_ok": True, "currency": "KES", "issues": []}
+
+    monkeypatch.setattr(intake, "parse_bid_pdf", parse)
+    monkeypatch.setattr(intake, "ask_json", lambda name, payload: {"category": "works",
+                                                                  "description": "fencing"})
+
+    intake.intake_node({"run_id": "run-1", "pdf_paths": ["a.pdf", "b.pdf", "c.pdf"]})
+
+    assert seen == ["intake-span", "intake-span", "intake-span"]
+
+
+def test_the_single_bid_path_also_keeps_the_context(monkeypatch):
+    import contextvars
+
+    marker = contextvars.ContextVar("opik-marker")
+    marker.set("intake-span")
+    seen = []
+
+    def parse(run_id, path):
+        seen.append(marker.get("LOST"))
+        return {"bidder": "Apex", "tender_ref": "T/1", "items": [], "stated_total": 1.0,
+                "computed_total": 1.0, "arithmetic_ok": True, "currency": "KES", "issues": []}
+
+    monkeypatch.setattr(intake, "parse_bid_pdf", parse)
+    monkeypatch.setattr(intake, "ask_json", lambda name, payload: {"category": "works",
+                                                                  "description": "fencing"})
+
+    intake.intake_node({"run_id": "run-1", "pdf_paths": ["only.pdf"]})
+
+    assert seen == ["intake-span"]
+
+
+def test_the_tender_is_recorded_on_the_trace_once_it_has_been_read(monkeypatch):
+    """It cannot be tagged at the start of a run: nothing has been parsed yet."""
+    from agent import tracing
+
+    tagged = []
+    monkeypatch.setattr(tracing, "record_tender", lambda ref: tagged.append(ref))
+    monkeypatch.setattr(intake, "record_tender", lambda ref: tagged.append(ref))
+    monkeypatch.setattr(intake, "parse_bid_pdf",
+                        lambda run_id, path: {"bidder": "Apex", "tender_ref": "KURA/ENG/2026/NRD/041",
+                                              "items": [], "stated_total": 1.0, "computed_total": 1.0,
+                                              "arithmetic_ok": True, "currency": "KES", "issues": []})
+    monkeypatch.setattr(intake, "ask_json", lambda name, payload: {"category": "works",
+                                                                  "description": "roads"})
+
+    intake.intake_node({"run_id": "run-1", "pdf_paths": ["a.pdf"]})
+
+    assert tagged == ["KURA/ENG/2026/NRD/041"]

@@ -316,3 +316,86 @@ def test_a_stream_without_reconfigure_is_not_fatal():
         assert build_console(False).no_color is False
     finally:
         monkey.undo()
+
+
+import io
+
+
+def test_a_report_with_no_evidence_is_approved_only_by_a_different_word():
+    """Typing the usual approval is refused when the report holds no benchmark at all."""
+    with pytest.raises(ValueError) as err:
+        parse_decision("a Deo Siatah", has_evidence=False)
+
+    assert "no comparable awards" in str(err.value)
+    assert "'p Your Name'" in str(err.value)
+
+
+def test_the_publishing_word_is_refused_when_there_is_evidence():
+    with pytest.raises(ValueError):
+        parse_decision("p Deo Siatah", has_evidence=True)
+
+
+def test_a_report_with_no_evidence_is_published_by_typing_p():
+    assert parse_decision("p Deo Siatah", has_evidence=False) == ("approved", "Deo Siatah")
+
+
+def test_a_report_with_no_evidence_can_still_be_declined_the_usual_way():
+    assert parse_decision("r Deo Siatah", has_evidence=False) == ("rejected", "Deo Siatah")
+
+
+def test_publishing_without_evidence_still_needs_a_name():
+    with pytest.raises(ValueError):
+        parse_decision("p", has_evidence=False)
+
+
+def test_publishing_without_evidence_still_refuses_a_placeholder():
+    with pytest.raises(ValueError):
+        parse_decision("p agent", has_evidence=False)
+
+
+def test_the_prompt_tells_the_person_what_the_two_words_mean(capsys, monkeypatch):
+    answers = iter(["p Deo Siatah"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    console = Console(no_color=True, width=100, file=io.StringIO())
+
+    decision = ask_decision(console, has_evidence=False)
+
+    assert decision["decision"] == "approved"
+    assert decision["approved_by"] == "Deo Siatah"
+    assert decision["note"] == "published without a benchmark: no comparable awards found"
+
+
+def test_the_prompt_offers_the_usual_words_when_there_is_evidence(capsys, monkeypatch):
+    answers = iter(["a Deo Siatah"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    console = Console(no_color=True, width=100, file=io.StringIO())
+
+    decision = ask_decision(console, has_evidence=True)
+
+    assert decision["note"] == ""
+
+
+def test_the_approval_panel_says_the_report_holds_no_evidence():
+    request = {"tender_ref": "T/1", "evidence_status": "no_evidence",
+               "benchmark": {"n": 0, "confidence": "insufficient", "median_kes": None,
+                             "q1_kes": None, "q3_kes": None},
+               "summary": "No comparable awards were found.",
+               "bids": [{"bidder": "Koromo Road Works Ltd", "total": 3231600000.0,
+                         "pct_vs_median": None, "position": None}]}
+
+    text = printed(approval_panel, request)
+
+    assert "holds no evidence" in text
+    assert "nothing about value for money" in text
+
+
+def test_a_report_with_evidence_does_not_carry_the_no_evidence_warning():
+    request = {"tender_ref": "T/1", "evidence_status": "has_evidence",
+               "benchmark": {"n": 17, "confidence": "high", "median_kes": 2670667.86,
+                             "q1_kes": 1736209.1, "q3_kes": 4124999.25},
+               "summary": "Seventeen awards compared.", "bids": []}
+
+    text = printed(approval_panel, request)
+
+    assert "holds no evidence" not in text
+    assert "17 comparable awards" in text

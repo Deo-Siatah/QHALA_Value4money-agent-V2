@@ -185,6 +185,24 @@ def test_groq_and_ollama_are_both_registered():
     assert "ollama" in llm.PROVIDERS
 
 
+def test_the_groq_client_is_given_room_to_finish_its_answer(monkeypatch):
+    """A similarity judgement over 28 awards came back cut off mid-object, finish_reason 'length'.
+
+    ChatGroq leaves max_tokens unset, so the provider's own cap applies. gpt-oss-120b spends part
+    of that budget reasoning before it writes anything, and what was left stopped the JSON half way
+    through the verdicts. Every award the model had not reached was then counted as excluded work.
+    """
+    monkeypatch.setattr(llm.settings, "llm_provider", "groq")
+    monkeypatch.setattr(llm.settings, "llm_model", "openai/gpt-oss-120b")
+    monkeypatch.setattr(llm.settings, "groq_api_key", "test-key")
+    monkeypatch.setattr(llm, "_model", None)
+
+    model = get_model()
+
+    assert model.max_tokens == llm.settings.llm_max_tokens
+    assert model.max_tokens >= 8192
+
+
 def test_the_real_providers_are_built_from_settings(monkeypatch):
     monkeypatch.setattr(llm.settings, "llm_provider", "ollama")
     monkeypatch.setattr(llm.settings, "llm_model", "llama3.1")

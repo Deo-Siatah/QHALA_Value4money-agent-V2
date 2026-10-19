@@ -241,8 +241,11 @@ def test_a_whole_run_from_candidates_to_a_verified_report(monkeypatch, audit_con
     monkeypatch.setattr(draft, "ask_json", fake_wording)
     monkeypatch.setattr(draft, "draft_review_file", draft_review_file)
 
-    pool_rows = [dict(award(f"a{i:02d}", float(i * 500_000.0)), title="Classroom block construction")
-                 for i in range(1, 13)]
+# The awards span 1.0M to 6.5M against a bid median of 9M. The smallest has to stay inside the
+    # scale band, ten times either side of the bid median, or quality_check drops it as a different
+    # size of job before the benchmark is built.
+    pool_rows = [dict(award(f"a{i:02d}", float(i) * 500_000.0 + 500_000.0),
+                      title="Classroom block construction") for i in range(1, 13)]
     current = {"run_id": "run-e2e", "tender_ref": "TENDER/NC/2026/014",
                "description": "construction of classroom blocks", "candidates": pool_rows,
                "quality_attempts": 0,
@@ -283,3 +286,60 @@ def test_a_figure_the_model_invents_fails_the_whole_run(monkeypatch):
     assert current["review_markdown"].startswith("# Price review evidence")
     assert result["verify_ok"] is False
     assert any("999.5" in failure for failure in result["verify_failures"])
+
+
+def test_a_thin_pool_may_not_label_a_bid_far_above_or_far_below(monkeypatch):
+    """A position computed against a handful of comparables is a guess wearing a percentage."""
+    from agent.nodes.verify_sources import verify_sources_node
+
+    state = {"run_id": "run-1", "review_markdown": "# Review\n\n" + NOT_ENOUGH + "\n",
+             "findings": [], "sources": [], "summary": "",
+             "bids": [{"bidder": "Bora Contractors (K) Ltd", "stated_total": 8650000.0}],
+             "pool": [], "pool_size": 2,
+"benchmark": {"n": 2, "confidence": "insufficient", "median_kes": None,
+                           "q1_kes": None, "q3_kes": None,
+                           "bids": [{"bidder": "Bora Contractors (K) Ltd", "total": 8650000.0,
+                                     "pct_vs_median": 228639.5, "position": "far_above"}]}}
+
+    result = verify_sources_node(state)
+
+    assert result["verify_ok"] is False
+    assert any("no position" in failure or "cannot be labelled" in failure
+               for failure in result["verify_failures"])
+
+
+def test_a_thin_pool_may_not_carry_a_percentage_at_all(monkeypatch):
+    from agent.nodes.verify_sources import verify_sources_node
+
+    state = {"run_id": "run-1",
+             "review_markdown": "# Review\n\nNot enough comparable awards to benchmark these bids.\n",
+             "findings": [{"text": "One bid is 228639.5% above the median of two similar awards.",
+                           "sources": []}],
+             "sources": [], "summary": "", "bids": [], "pool": [], "pool_size": 2,
+             "benchmark": {"n": 2, "confidence": "insufficient", "median_kes": None,
+                           "q1_kes": None, "q3_kes": None, "bids": []}}
+
+    result = verify_sources_node(state)
+
+    assert result["verify_ok"] is False
+
+
+def test_a_real_pool_may_still_say_far_above():
+    from agent.nodes.verify_sources import verify_sources_node
+
+    state = {"run_id": "run-1",
+             "review_markdown": "# Review\n\nOne bid is 204.6% above the median of 17 awards.\n",
+             "findings": [{"text": "One bid is 204.6% above the median of 17 similar awards.",
+                           "sources": ["a01"]}],
+             "sources": [{"award_id": "a01", "value_kes": 100.0}], "summary": "",
+             "bids": [{"bidder": "Bora", "stated_total": 8650000.0}],
+             "pool": [{"award_id": "a01", "value_kes": 100.0}], "pool_size": 17,
+             "benchmark": {"n": 17, "confidence": "high", "median_kes": 2860000.0,
+                           "q1_kes": 1.0, "q3_kes": 3.0,
+                           "bids": [{"bidder": "Bora", "total": 8650000.0,
+                                     "pct_vs_median": 204.6, "position": "far_above"}]}}
+
+    result = verify_sources_node(state)
+
+    assert not [failure for failure in result["verify_failures"]
+                if "no position" in failure or "cannot be labelled" in failure]

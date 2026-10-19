@@ -74,16 +74,31 @@ def _verdicts(prompt_name: str, asked: Dict[str, Any], expected: List[str],
     return verdicts
 
 
-def _ask(prompt_name: str, payload: Dict[str, Any], expected: List[str],
+def _ask(prompt_name: str, build_payload: Any, expected: List[str],
          vocabulary: Tuple[str, ...]) -> Tuple[Dict[str, Dict[str, str]], List[str]]:
-    """Ask one prompt and return its verdicts in one vocabulary, or record why there are none."""
-    if not expected:
-        return {}, []
-    try:
-        asked = ask_json(prompt_name, payload)
-    except LlmError as exc:
-        return {}, [f"model could not answer {prompt_name}: {exc}"]
-    return _verdicts(prompt_name, asked, expected, vocabulary), []
+    """Ask one prompt in batches and return its verdicts, or record why there are none.
+
+    The awards are judged a batch at a time because one answer covering every candidate was cut off
+    part way through: the model ran out of tokens mid-object, the reply stopped being JSON, and every
+    award it had not reached was then counted as excluded work, leaving an empty pool. A batch that
+    cannot be answered costs only the awards it carried; the batches either side still count.
+    """
+    verdicts: Dict[str, Dict[str, str]] = {}
+    errors: List[str] = []
+    for batch in _batches(expected):
+        try:
+            asked = ask_json(prompt_name, build_payload(batch))
+        except LlmError as exc:
+            errors.append(f"model could not answer {prompt_name}: {exc}")
+            continue
+        verdicts.update(_verdicts(prompt_name, asked, batch, vocabulary))
+    return verdicts, errors
+
+
+def _batches(ids: List[str]) -> List[List[str]]:
+    """Split the awards into groups no larger than judgement_batch_size."""
+    size = max(1, settings.judgement_batch_size)
+    return [ids[start:start + size] for start in range(0, len(ids), size)]
 
 
 def _as_money(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -137,6 +152,7 @@ def quality_check_node(state: AgentState) -> dict:
     """Rule-check the candidates, judge the ones rules cannot settle, and build the pool."""
     run_id = state["run_id"]
     candidates = state.get("candidates", [])
+    description = state.get("description")
     quality = flag_data_quality(run_id, candidates)
     rows = {row["award_id"]: row for row in candidates}
 
@@ -148,14 +164,14 @@ def quality_check_node(state: AgentState) -> dict:
 
     similarity, errors = _ask(
         "quality_similarity_judgement",
-        {"description": state.get("description"),
-         "awards": [_award_payload(_as_money(rows[award_id])) for award_id in usable]},
+        lambda batch: {"description": description,
+                       "awards": [_award_payload(_as_money(rows[award_id])) for award_id in batch]},
         usable, tuple(SAME_WORK))
     suspect_answers, suspect_errors = _ask(
         "quality_suspect_verdicts",
-        {"description": state.get("description"), "median_kes": quality.get("median_kes"),
-         "awards": [_suspect_payload(r, _as_money(rows[r["award_id"]]))
-                    for r in results if r["award_id"] in suspects]},
+        lambda batch: {"description": description, "median_kes": quality.get("median_kes"),
+                       "awards": [_suspect_payload(flagged, _as_money(rows[flagged["award_id"]]))
+                                  for flagged in results if flagged["award_id"] in batch]},
         suspects, KEEP_OR_EXCLUDE)
 
     pool_verdicts = {award_id: {"verdict": SAME_WORK[entry["verdict"]], "reason": entry["reason"]}

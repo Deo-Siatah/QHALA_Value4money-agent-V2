@@ -85,7 +85,7 @@ def _cited_sources(findings: List[Dict[str, Any]], pool: List[Dict[str, Any]]) -
     return ordered
 
 
-def _review(state: AgentState, answer: Dict[str, Any], sources: List[Dict[str, Any]]) -> Dict[str, Any]:
+def build_review(state: AgentState, answer: Dict[str, Any], sources: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Assemble what draft_review_file needs: the model's wording inside our structure."""
     comments = answer.get("bid_comments") or {}
     return {
@@ -119,7 +119,7 @@ def draft_node(state: AgentState) -> dict:
     }
 
     try:
-        rendered = draft_review_file(state["run_id"], _review(state, answer, sources))
+        rendered = draft_review_file(state["run_id"], build_review(state, answer, sources))
     except ReviewError as exc:
         result["review_markdown"] = ""
         result["errors"] = [f"draft_review_file refused the wording: {exc}"]

@@ -1,0 +1,87 @@
+% The evidence file as LaTeX, for a committee that keeps the source. The figures are the ones the
+% agent already rendered into the markdown; see api/reports.py, which builds every row from the same
+% review dict draft_review_file validated.
+%
+% Compiles with a UTF-8 engine: pdflatex with inputenc below, or xelatex or lualatex as they are.
+% There is no TeX engine in this project's environment, so the file is written for whoever has one.
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=2cm]{geometry}
+\usepackage{longtable,booktabs,array}
+
+\begin{document}
+
+\section*{Price review evidence: {{ tender_ref | tex }}
+
+\noindent Run ID: {{ run_id | tex }}
+
+\begin{quote}
+\itshape {{ notice | tex }}
+\end{quote}
+
+\section*{Summary}
+
+{{ summary | tex }}
+
+\section*{Comparison pool}
+
+\begin{itemize}
+{% for item in pool_lines %}
+  \item {{ item | tex }}
+{% endfor %}
+\end{itemize}
+
+\section*{Bids}
+
+\begin{longtable}{@{}p{4.2cm}rrp{2.6cm}p{6.4cm}@{}}
+\toprule
+\textbf{Bidder} & \textbf{Total (KES)} & \textbf{\% vs median} & \textbf{Position} & \textbf{Comment} \\
+\midrule
+\endhead
+{% for bid in bids %}
+{{ bid.bidder | tex }} & {{ bid.total | tex }} & {{ bid.pct | tex }} & {{ bid.position | tex }} & {{ bid.comment | tex }} \\
+{% endfor %}
+\bottomrule
+\end{longtable}
+
+\section*{Findings}
+{% for finding in findings %}
+
+\begin{enumerate}
+\item {{ finding.text | tex }}
+\end{enumerate}
+
+\noindent\hspace*{1.5em}Sources: {{ finding.sources | tex }}
+{% endfor %}
+{% if not findings %}
+
+\noindent No findings were recorded for this review.
+{% endif %}
+
+\section*{Limitations}
+
+\begin{itemize}
+{% for item in limitations %}
+  \item {{ item | tex }}
+{% endfor %}
+\end{itemize}
+
+\section*{Sources}
+
+\begin{longtable}{@{}p{3.2cm}p{4.4cm}r p{4.0cm}p{5.4cm}r@{}}
+\toprule
+\textbf{Award ID} & \textbf{OCID} & \textbf{Data year} & \textbf{Buyer} & \textbf{Title} & \textbf{Value (KES)} \\
+\midrule
+\endhead
+{% for source in sources %}
+{{ source.award_id | tex }} & {{ source.ocid | tex }} & {{ source.data_year }} & {{ source.buyer_name | tex }} & {{ source.title | tex }} & {{ source.value_kes | tex }} \\
+{% endfor %}
+\bottomrule
+\end{longtable}
+{% if dataset %}
+
+\noindent \textit{ {{ dataset | tex }} }
+{% endif %}
+
+\end{document}

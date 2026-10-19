@@ -1,0 +1,163 @@
+/* Tailwind v4, CSS first: the theme lives here and there is no tailwind.config.js.
+ *
+ * Near-monochrome on purpose. This interface sits in front of a tender committee reading evidence
+ * about named companies, so colour is not allowed to imply a judgement: there is deliberately no
+ * green for a bid that looks fine and no red for one that does not. One ink scale carries the whole
+ * interface, and a hue appears only where the meaning changes.
+ *
+ *   accent  deep slate blue, for the one thing a page is asking you to do
+ *   done    green, ONLY on a step that has finished. A step is not a bidder.
+ *   ask     amber, ONLY for "this is a question to ask"
+ *   stop    red, ONLY for a run that stopped or was declined
+ *   thin    slate, ONLY for "there was not enough evidence"
+ *
+ * Because there is so little colour, state has to survive without it. Every state is carried by a
+ * word and a glyph as well as a tone, so the interface reads correctly in greyscale and in print,
+ * and a run of evidence prints in black and white without losing anything.
+ *
+ * The ground is slate rather than white because a white page with white cards has no structure; the
+ * panels stay white so they read as raised off it.
+ */
+
+@import "tailwindcss";
+
+@theme {
+  --color-paper: #ffffff;
+  --color-ground: #f8fafc;
+
+  --color-ink-100: #f1f5f9;
+  --color-ink-200: #e2e8f0;
+  --color-ink-300: #cbd5e1;
+  --color-ink-400: #94a3b8;
+  --color-ink-500: #64748b;
+  --color-ink-700: #334155;
+  --color-ink-900: #0f172a;
+
+  --color-accent: #4f46e5;
+  --color-accent-strong: #4338ca;
+  --color-accent-soft: #eef2ff;
+  --color-accent-glow: #6366f1;
+
+  --color-done: #059669;
+  --color-done-soft: #ecfdf5;
+  --color-ask: #d97706;
+  --color-stop: #e11d48;
+  --color-thin: #64748b;
+
+  /* Soft elevation. Two low-spread shadows rather than one hard one, so a panel looks raised off the
+   * slate ground instead of stamped onto it. */
+  --shadow-soft: 0 1px 2px rgb(15 23 42 / 0.04), 0 1px 3px rgb(15 23 42 / 0.06);
+  --shadow-lift: 0 2px 4px rgb(15 23 42 / 0.05), 0 8px 20px rgb(15 23 42 / 0.07);
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
+    sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", "Cascadia Mono", Consolas, monospace;
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    @apply bg-ground text-ink-700 font-sans antialiased;
+  }
+
+  /* Focus is never removed, only made visible: this interface is used by people reading figures. */
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-accent;
+  }
+}
+
+@layer utilities {
+  /* A step that is running says so with a slow glow, not a strobe. The animations carry the state
+   * the spec asks for (active / completed), and are switched off entirely when a reader has asked
+   * their system for reduced motion. */
+  @keyframes pulse-glow {
+    0%,
+    100% {
+      box-shadow: 0 0 0 0 rgb(99 102 241 / 0.45);
+    }
+    50% {
+      box-shadow: 0 0 0 10px rgb(99 102 241 / 0);
+    }
+  }
+
+  @keyframes slot-in {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  @keyframes check-pop {
+    from {
+      opacity: 0;
+      transform: scale(0.5);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+
+  .animate-pulse-glow {
+    animation: pulse-glow 1.8s ease-in-out infinite;
+  }
+
+  .animate-slot-in {
+    animation: slot-in 0.24s ease-out;
+  }
+
+  .animate-check-pop {
+    animation: check-pop 0.2s ease-out;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .animate-pulse-glow,
+    .animate-slot-in,
+    .animate-check-pop {
+      animation: none;
+    }
+  }
+}
+
+@layer components {
+  /* The evidence file prints, and only the evidence file prints.
+   *
+   * The run page is one long vertical stream, so printing it whole would put the header, the step
+   * list and the approval form in front of a committee member who asked for the evidence. Everything
+   * is hidden by default and the report panel turns itself back on. */
+  @media print {
+    body * {
+      visibility: hidden;
+    }
+
+    .print-only,
+    .print-only * {
+      visibility: visible;
+    }
+
+    .print-only {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+    }
+
+    body {
+      @apply bg-paper text-ink-900;
+    }
+
+    .print-block {
+      break-inside: avoid;
+    }
+
+    @page {
+      margin: 16mm;
+    }
+  }
+}

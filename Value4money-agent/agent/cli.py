@@ -31,8 +31,9 @@ from rich.text import Text
 from config import settings
 from agent.checkpointer import checkpointer
 from agent.graph import build_graph
+from agent.nodes.approval import PUBLISH_ANYWAY
 from agent.state import initial_state
-from agent.tracing import flush, init_tracing
+from agent.tracing import flush, init_tracing, start_trace, traced
 
 STEP_NAMES = ["intake", "research", "quality_check", "score", "draft", "verify_sources",
               "approval", "file"]
@@ -114,7 +115,7 @@ def tender_line(console: Console, update: Dict[str, Any]) -> None:
     console.print(Panel(body, title="read", border_style="cyan", padding=(1, 2)))
 
 
-def _summary(name: str, update: Dict[str, Any]) -> str:
+def summarise(name: str, update: Dict[str, Any]) -> str:
     """One fact about what a node just did, read from what that node returned."""
     if name == "intake":
         return f"{len(update.get('bids', []))} bids read"
@@ -146,13 +147,16 @@ def step(console: Console, index: int, name: str, elapsed: float, update: Dict[s
     """One finished node: how far, which step, how long, and what it found."""
     console.print(f"  [green]✓[/green] {index}/{len(STEP_NAMES)}  "
                   f"[bold]{name:<16}[/bold] {elapsed:>5.1f}s   "
-                  f"[dim]{_summary(name, update)}[/dim]")
+                  f"[dim]{summarise(name, update)}[/dim]")
 
 
 def approval_panel(console: Console, request: Dict[str, Any]) -> None:
     """Show the approver everything needed to decide, and nothing that presses them."""
     benchmark = request["benchmark"]
     body = Text()
+    if request.get("evidence_status") == "no_evidence":
+        body.append("this report has no comparable awards, so it holds no evidence\n")
+        body.append("  publishing it is still allowed, but it says nothing about value for money.\n\n")
     if benchmark["confidence"] == "insufficient":
         body.append("not enough comparable awards\n")
         body.append(f"  {benchmark['n']} survived the checks, so there is no benchmark to "
@@ -184,17 +188,36 @@ def approval_panel(console: Console, request: Dict[str, Any]) -> None:
     console.print(table)
 
 
-def parse_decision(answer: str) -> Tuple[str, str]:
+def parse_decision(answer: str, has_evidence: bool = True) -> Tuple[str, str]:
     """Read 'a Name' or 'r Name' into a decision and the name of the person making it.
 
-    The decision is a word of its own, so 'approve Deo' is refused rather than read as an approval
-    given by someone called 'pprove Deo'.
+    When the report holds no benchmark at all, plain approval is refused: publishing a document with
+    no evidence in it has to be a choice the person can see they are making, so they type 'p Name'.
     """
-    parts = (answer or "").strip().split(None, 1)
-    if not parts or parts[0].lower() not in ("a", "r"):
+    text = (answer or "").strip()
+    parts = text.split(None, 1)
+    if not parts:
         raise ValueError("answer with 'a Your Name' to approve, or 'r Your Name' to reject")
-    decision = "approved" if parts[0].lower() == "a" else "rejected"
+
+    verb = parts[0].lower()
     name = parts[1].strip() if len(parts) > 1 else ""
+
+    if not has_evidence and verb == "a":
+        raise ValueError("this report has no comparable awards, so it holds no evidence. "
+                         "type 'p Your Name' to publish it anyway, or 'r Your Name' to stop")
+    if verb == "p" and has_evidence:
+        raise ValueError("this report has evidence, so it can simply be approved: "
+                         "answer with 'a Your Name'")
+    if verb == "p":
+        if len(name) < 2:
+            raise ValueError("publishing without evidence needs the name of the person deciding")
+        if name.lower() in PLACEHOLDERS:
+            raise ValueError("that is not a person. This report needs a named human.")
+        return "approved", name
+    if verb not in ("a", "r"):
+        raise ValueError("answer with 'a Your Name' to approve, or 'r Your Name' to reject")
+
+    decision = "approved" if verb == "a" else "rejected"
     if len(name) < 2:
         raise ValueError("a decision needs the name of the person making it")
     if name.lower() in PLACEHOLDERS:
@@ -202,17 +225,23 @@ def parse_decision(answer: str) -> Tuple[str, str]:
     return decision, name
 
 
-def ask_decision(console: Console) -> Dict[str, str]:
+def ask_decision(console: Console, has_evidence: bool = True) -> Dict[str, str]:
     """Ask for the decision and the name, refusing anything that is not a person."""
-    console.print("\n  [bold]Decision and your name[/bold] "
-                  "[dim](a Deo Siatah, or r Deo Siatah to reject)[/dim]")
+    if has_evidence:
+        hint = "(a Deo Siatah, or r Deo Siatah to reject)"
+    else:
+        hint = "(p Your Name to publish it without evidence, or r Your Name to stop)"
+    console.print(f"\n  [bold]Decision and your name[/bold] [dim]{hint}[/dim]")
     while True:
         try:
-            decision, name = parse_decision(input("  > "))
+            decision, name = parse_decision(input("  > "), has_evidence=has_evidence)
         except ValueError as exc:
             console.print(f"  [red]{exc}[/red]")
             continue
-        return {"decision": decision, "approved_by": name, "note": ""}
+        decision_payload = {"decision": decision, "approved_by": name, "note": ""}
+        if not has_evidence and decision == "approved":
+            decision_payload["note"] = "published without a benchmark: no comparable awards found"
+        return decision_payload
 
 
 def filed_panel(console: Console, result: Dict[str, Any], run_id: str) -> None:
@@ -315,7 +344,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     """Start a run, watch it work, and take the approval from the person at the keyboard."""
     args = parse_args(argv)
     console = build_console(args.no_colour)
-    init_tracing(args.run_id)
 
     missing = [name for name, value in [("LLM_MODEL", settings.llm_model),
                                         ("DATABASE_URL", settings.database_url)] if not value]
@@ -345,22 +373,30 @@ def main(argv: Optional[List[str]] = None) -> int:
         console.print(Panel(f"[red]cannot start:[/red] {exc}", title=TITLE, border_style="red"))
         return 4
 
+# The root span is opened here rather than by a decorator, because a decorator runs at import
+    # time, before init_tracing() has configured Opik, and would quietly produce no trace at all.
+    init_tracing(run_id)
     with checkpointer() as saver:
         banner(console, run_id, paths)
         console.print()
         graph = build_graph(saver)
-        request = run_live(console, graph, initial_state(run_id, paths, started_at), config, tokens)
 
-        if request is None:
-            console.print(Panel("[yellow]the run finished without asking anyone[/yellow]\n"
-                                "audit_log will say where it stopped.", border_style="yellow"))
-            flush()
-            return 4
+        def work() -> Dict[str, Any]:
+            """The part of the run that belongs in the root span, up to and including filing."""
+            start_trace(run_id)
+            request = run_live(console, graph, initial_state(run_id, paths, started_at), config, tokens)
+            if request is None:
+                return {}
+            approval_panel(console, request)
+            evidence = request.get("evidence_status") != "no_evidence"
+            decision = ask_decision(console, has_evidence=evidence)
+            if not evidence and decision["decision"] == "approved":
+                decision = {**decision, "decision": PUBLISH_ANYWAY}
+            console.print(f"\n  [dim]{decision['approved_by']} {decision['decision']} this report"
+                          f"[/dim]\n")
+            return graph.invoke(Command(resume=decision), config)
 
-        approval_panel(console, request)
-        decision = ask_decision(console)
-        console.print(f"\n  [dim]{decision['approved_by']} {decision['decision']} this report[/dim]\n")
-        result = graph.invoke(Command(resume=decision), config)
+        result = traced("general", "agent_run")(work)()
 
     filed_panel(console, result, run_id)
     submission = result.get("submission") or {}
