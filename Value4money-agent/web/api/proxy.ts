@@ -24,8 +24,14 @@ async function proxy(request: Request): Promise<Response> {
     });
   }
 
-  // Vercel passes a path-relative request.url; the base only makes it parseable.
+  // Vercel's rewrite turns the API path into a "path" query parameter; the base only makes
+  // request.url parseable.
   const url = new URL(request.url, "https://vercel.local");
+  const path = url.searchParams.getAll("path").join("/").replace(/^\/+/, "");
+  if (!path) {
+    return json(404, { detail: "not found" });
+  }
+
   const headers: Record<string, string> = { "x-api-token": API_TOKEN };
   for (const name of ["content-type", "accept"]) {
     const value = request.headers.get(name);
@@ -36,7 +42,7 @@ async function proxy(request: Request): Promise<Response> {
 
   // A GET or HEAD has no body; passing one to fetch would make Node reject the request.
   const hasBody = request.method !== "GET" && request.method !== "HEAD";
-  const upstream = await fetch(`${BACKEND_URL}${url.pathname}${url.search}`, {
+  const upstream = await fetch(`${BACKEND_URL}/api/${path}`, {
     method: request.method,
     headers,
     body: hasBody ? request.body : undefined,
