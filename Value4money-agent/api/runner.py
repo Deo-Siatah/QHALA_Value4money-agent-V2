@@ -26,6 +26,7 @@ from langgraph.types import Command
 
 from config import settings
 from agent.state import initial_state
+from agent.tracing import flush, record_graph, reset_trace_tags, start_trace, traced
 from api import models
 from api.events import RunEventChannel, RunEventHandler
 
@@ -162,6 +163,10 @@ class Runner:
         Called with a command it resumes a paused run, and with an initial state it starts one.
         Either way it stops at the next interrupt, and either way it leaves the channel open when it
         does: the run is not over, a person still has to answer.
+
+        The work happens inside one Opik root span, named for the run, so the nodes, tools and model
+        calls below it form one trace. start_trace() is called from inside that span because a thread
+        id written before it exists is written on nothing.
         """
         config = self._config(run)
         run.status = models.RunStatus.running
@@ -173,23 +178,37 @@ class Runner:
         payload: Any = command if command is not None else initial_state(
             run.run_id, run.pdf_paths, run.started_at)
 
-        try:
-            for chunk in self.graph.stream(payload, config, stream_mode="updates"):
-                if not self._read(chunk, run):
-                    break
-        except Exception as exc:  # the run failed; the browser is told in plain words
-            run.status = models.RunStatus.failed
-            run.channel.emit(models.RunError(step=self._current_step(run), message=f"{type(exc).__name__}: {exc}"))
-            self._collect(run, config)
-            self._finish(run)
-            return
+        def work() -> None:
+            reset_trace_tags()
+            start_trace(run.run_id)
+            record_graph(self.graph)
+            try:
+                for chunk in self.graph.stream(payload, config, stream_mode="updates"):
+                    if not self._read(chunk, run):
+                        break
+            except Exception as exc:  # the run failed; the browser is told in plain words
+                run.status = models.RunStatus.failed
+                run.channel.emit(models.RunError(step=self._current_step(run), message=f"{type(exc).__name__}: {exc}"))
+                self._collect(run, config)
+                self._finish(run)
+                return
 
-        self._collect(run, config)
-        with run.lock:
-            run.busy = False
-        if run.waiting_for_a_person:
-            return
-        self._finish(run)
+            self._collect(run, config)
+            with run.lock:
+                run.busy = False
+            if run.waiting_for_a_person:
+                return
+            self._finish(run)
+
+        try:
+            traced("general", "agent_run")(work)()
+        finally:
+            # The SDK batches spans; a long-lived server would hold the run's trace until the next
+            # flush. Tracing is never allowed to break a run, so this failure is swallowed.
+            try:
+                flush()
+            except Exception:
+                pass
 
     def _read(self, chunk: Any, run: Run) -> bool:
         """Read one thing the graph said. False means the run paused and the loop should stop."""

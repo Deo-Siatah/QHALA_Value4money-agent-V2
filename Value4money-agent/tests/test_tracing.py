@@ -1,11 +1,12 @@
 import sys
+import threading
 import types
 
 import pytest
 
 from agent import tracing
 from agent.tracing import (annotate_llm, flush, init_tracing, log_model_call, record_tender,
-                         start_trace, traced, trace_run)
+                         reset_trace_tags, start_trace, traced, trace_run)
 
 
 def fake_opik():
@@ -542,3 +543,57 @@ def test_nodes_are_no_longer_wrapped_twice(monkeypatch):
     build_graph()
 
     assert not [entry for entry in calls if entry[0] == "track"]
+
+
+def test_a_tracing_backend_that_will_not_configure_leaves_the_run_alone(monkeypatch):
+    """The evidence file is filed into Postgres; a trace store must never stop the service booting."""
+    module, calls = fake_opik()
+
+    def refuse(**kwargs):
+        raise RuntimeError("opik is unreachable")
+
+    module.configure = refuse
+    monkeypatch.setattr(tracing, "opik", module)
+    monkeypatch.setattr(tracing.settings, "opik_enabled", True)
+    monkeypatch.setattr(tracing.settings, "opik_api_key", "opik-secret")
+
+    assert init_tracing("run-1") is False
+    assert tracing.enabled() is False
+
+
+def test_two_runs_on_two_threads_each_tag_their_own_tender(monkeypatch):
+    """A web process drives runs concurrently; one run's tender must not hide another's."""
+    module, calls = fake_opik()
+    monkeypatch.setattr(tracing, "opik", module)
+    monkeypatch.setattr(tracing.settings, "opik_enabled", True)
+    monkeypatch.setattr(tracing.settings, "opik_api_key", "opik-secret")
+    init_tracing(None)
+
+    a_started = threading.Event()
+    b_rewound = threading.Event()
+
+    def run_a():
+        reset_trace_tags()
+        start_trace("run-a")
+        a_started.set()
+        b_rewound.wait(2)
+        record_tender("T/A")
+
+    def run_b():
+        a_started.wait(2)
+        reset_trace_tags()
+        start_trace("run-b")
+        b_rewound.set()
+        record_tender("T/B")
+
+    threads = [threading.Thread(target=run_a), threading.Thread(target=run_b)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+
+    traces = [entry[1] for entry in calls if entry[0] == "trace"]
+    assert any(t.get("thread_id") == "run-a" for t in traces)
+    assert any(t.get("thread_id") == "run-b" for t in traces)
+    assert any("T/A" in t.get("tags", []) for t in traces)
+    assert any("T/B" in t.get("tags", []) for t in traces)

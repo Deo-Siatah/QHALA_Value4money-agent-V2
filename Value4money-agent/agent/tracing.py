@@ -17,6 +17,7 @@
 
 import functools
 import inspect
+from contextvars import ContextVar
 from typing import Any, Callable, Dict, Optional
 
 from langgraph.errors import GraphInterrupt
@@ -48,10 +49,15 @@ def init_tracing(run_id: Optional[str] = None) -> bool:
     if opik is None or not settings.opik_enabled or not settings.opik_api_key:
         return False
 
-    opik.configure(api_key=settings.opik_api_key,
-                   workspace=settings.opik_workspace or None,
-                   project_name=settings.opik_project,
-                   use_local=False)
+    try:
+        opik.configure(api_key=settings.opik_api_key,
+                       workspace=settings.opik_workspace or None,
+                       project_name=settings.opik_project,
+                       use_local=False)
+    except Exception:
+        # A tracing backend that cannot be configured must not stop the service that files
+        # evidence. The run is still audited in Postgres; only the spans are lost.
+        return False
     _enabled = True
     reset_trace_tags()
     return True
@@ -110,7 +116,10 @@ class _Paused(Exception):
 
 PROJECT_TAG = "value4money"
 
-_tender_recorded = False
+# Whether this run has already tagged its trace with the tender. A ContextVar rather than a module
+# global because the web server drives several runs at once, each on its own thread: one run
+# recording its tender must not make another run skip its own.
+_tender_recorded: ContextVar[bool] = ContextVar("tender_recorded", default=False)
 
 
 def start_trace(run_id: Optional[str], tender_ref: Optional[str] = None) -> None:
@@ -125,13 +134,12 @@ def start_trace(run_id: Optional[str], tender_ref: Optional[str] = None) -> None
     tender is a tag rather than a thread, because two runs of the same tender are two threads, and
     threading them together would split a run away from its own approval.
     """
-    global _tender_recorded
     if not _enabled or opik is None:
         return
     tags = [PROJECT_TAG]
     if tender_ref:
         tags.append(tender_ref)
-        _tender_recorded = True
+        _tender_recorded.set(True)
     _quietly(lambda: opik.opik_context.update_current_trace(
         thread_id=run_id, tags=tags))
 
@@ -142,17 +150,15 @@ def record_tender(tender_ref: str) -> None:
     The tender reference does not exist until intake has parsed a bid, so it cannot be set when the
     run starts. Tagging it here is what makes runs of one tender comparable in the Opik filters.
     """
-    global _tender_recorded
-    if not _enabled or opik is None or not tender_ref or _tender_recorded:
+    if not _enabled or opik is None or not tender_ref or _tender_recorded.get():
         return
-    _tender_recorded = True
+    _tender_recorded.set(True)
     _quietly(lambda: opik.opik_context.update_current_trace(tags=[PROJECT_TAG, tender_ref]))
 
 
 def reset_trace_tags() -> None:
     """Forget which tender was tagged, so the next run in this process starts clean."""
-    global _tender_recorded
-    _tender_recorded = False
+    _tender_recorded.set(False)
 
 
 def is_approval_pause(error: str) -> bool:

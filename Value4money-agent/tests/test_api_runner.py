@@ -16,6 +16,56 @@ from api.runner import Runner
 from config import settings
 
 
+def test_a_web_run_is_one_root_trace_named_for_the_run_and_flushed(monkeypatch):
+    """The web has no agent/run.py to open the trace, so the runner does it around the graph."""
+    from api import runner as runner_module
+
+    calls = []
+
+    def fake_traced(span_type="general", name=None):
+        def decorate(fn):
+            def wrapper(*args, **kwargs):
+                calls.append(("span", span_type, name))
+                return fn(*args, **kwargs)
+            return wrapper
+        return decorate
+
+    monkeypatch.setattr(runner_module, "traced", fake_traced)
+    monkeypatch.setattr(runner_module, "reset_trace_tags", lambda: calls.append("reset"))
+    monkeypatch.setattr(runner_module, "start_trace",
+                        lambda run_id: calls.append(("start", run_id)))
+    monkeypatch.setattr(runner_module, "record_graph", lambda graph: calls.append("graph"))
+    monkeypatch.setattr(runner_module, "flush", lambda: calls.append("flush"))
+
+    run = drive(runner())
+
+    wait(lambda: "flush" in calls)
+    assert run.status == models.RunStatus.awaiting_approval
+    assert ("span", "general", "agent_run") in calls
+    assert ("start", "run-1") in calls
+    assert "graph" in calls
+    assert "flush" in calls
+    assert calls.index(("span", "general", "agent_run")) < calls.index(("start", "run-1"))
+    assert calls.index("flush") > calls.index(("start", "run-1"))
+
+
+def test_a_web_run_that_breaks_is_still_flushed(monkeypatch):
+    """A failed run has a trace too, and it must not sit in the SDK's buffer."""
+    from api import runner as runner_module
+
+    calls = []
+    monkeypatch.setattr(runner_module, "traced",
+                        lambda span_type="general", name=None: (lambda fn: fn))
+    monkeypatch.setattr(runner_module, "reset_trace_tags", lambda: None)
+    monkeypatch.setattr(runner_module, "start_trace", lambda run_id: None)
+    monkeypatch.setattr(runner_module, "record_graph", lambda graph: None)
+    monkeypatch.setattr(runner_module, "flush", lambda: calls.append("flush"))
+
+    drive(runner(raises=RuntimeError("the database is away")))
+
+    assert "flush" in calls
+
+
 class Interrupt:
     """What LangGraph puts in the __interrupt__ tuple."""
 

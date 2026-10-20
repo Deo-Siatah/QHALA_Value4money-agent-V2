@@ -85,6 +85,11 @@ Render's proxy idle timeout (~55s) is already covered by the ten-second heartbea
 sends. Attach a persistent disk for `uploads/` and `outputs/` if you want those to survive a
 redeploy.
 
+To trace runs started from the browser, set `OPIK_ENABLED=true` and `OPIK_API_KEY`, plus
+`OPIK_WORKSPACE` if your workspace is not the default and `OPIK_PROJECT_NAME` if you want a project
+other than `value4money-agent`. These belong only on the backend; the API configures Opik at startup
+before it builds the graph, so a web-started run produces the same trace, thread and graph as the CLI.
+
 ### Frontend (Vercel)
 
 Point Vercel at the `web/` directory (framework preset **Vite**; `web/vercel.json` sets the build and

@@ -34,6 +34,7 @@ from sse_starlette.sse import EventSourceResponse
 from agent.checkpointer import close_shared_saver, shared_saver
 from agent.graph import build_graph
 from agent.nodes.approval import HAS_EVIDENCE, PUBLISH_ANYWAY, needs_publish_anyway
+from agent.tracing import init_tracing
 from api import models
 from api.events import RunEventChannel
 from api.reports import render_pdf, render_tex, review_from_state
@@ -136,13 +137,18 @@ def create_app(runner: Optional[Runner] = None) -> FastAPI:
         if not settings.api_token:
             raise RuntimeError("API_TOKEN is not set: this API can approve and file evidence files, "
                                "so it refuses to start without a token")
-        app.state.runner = runner or Runner(build_graph(shared_saver()),
-                                            max_concurrency=settings.run_max_concurrency)
         app.state.saver_open = runner is None
         if runner is None:
+            # Tracing has to be configured before the graph is built: build_graph() asks the
+            # tracer whether tracing is on, and a graph built while it was off never reaches Opik.
+            init_tracing()
+            app.state.runner = Runner(build_graph(shared_saver()),
+                                      max_concurrency=settings.run_max_concurrency)
             # One setting, set once. Every run's files sit under it, so absolute paths validate in
             # parse_bid_pdf without anything being mutated per request.
             settings.bids_dir = settings.uploads_dir
+        else:
+            app.state.runner = runner
         try:
             yield
         finally:
