@@ -17,7 +17,7 @@ export const config = { maxDuration: 300 };
 const BACKEND_URL = (process.env.BACKEND_URL ?? "").replace(/\/$/, "");
 const API_TOKEN = process.env.API_TOKEN ?? "";
 
-export default async function handler(request: Request): Promise<Response> {
+async function proxy(request: Request): Promise<Response> {
   if (!BACKEND_URL || !API_TOKEN) {
     return json(500, {
       detail: "BACKEND_URL and API_TOKEN must be set on this Vercel project",
@@ -54,6 +54,8 @@ export default async function handler(request: Request): Promise<Response> {
 
   return new Response(upstream.body, { status: upstream.status, headers: responseHeaders });
 }
+
+export default { fetch: proxy };
 
 function json(status: number, body: Record<string, string>): Response {
   return new Response(JSON.stringify(body), {
