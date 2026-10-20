@@ -24,7 +24,8 @@ export default async function handler(request: Request): Promise<Response> {
     });
   }
 
-  const url = new URL(request.url);
+  // Vercel passes a path-relative request.url; the base only makes it parseable.
+  const url = new URL(request.url, "https://vercel.local");
   const headers: Record<string, string> = { "x-api-token": API_TOKEN };
   for (const name of ["content-type", "accept"]) {
     const value = request.headers.get(name);
